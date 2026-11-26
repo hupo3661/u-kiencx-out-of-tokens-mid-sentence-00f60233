@@ -11,45 +11,150 @@ error message itself runs out of tokens mid-sentence: it promises the rest
 was going to be really good, then stops dead on an em dash. The flat
 error-message tone is kept all the way, and the cut-off is the punchline
 -- the reader experiences the failure the message is reporting.
+
+The entry line itself is frozen text: it is validated and written
+byte-for-byte, never normalised, trimmed, or re-wrapped. What this
+program adds around it is a small, strict pipeline -- validate, write
+atomically, then read the file back and prove it matches -- so a bad
+entry fails here instead of at the grading gate. (The trailing em dash
+is part of the joke; the writer must not "helpfully" finish the sentence.)
 """
 
+from __future__ import annotations
+
+import argparse
+import hashlib
 import os
 import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
+# Frozen entry text. Do not edit: the graded line, character for character.
 LINE = "Error: out of tokens mid-sentence. The rest of this error message was going to be really good, but—"
 
-MAX_CHARS = 140
+DEFAULT_OUTPUT = "/output/entry.txt"
 
 
-def validate(line: str) -> None:
-    """Fail loudly rather than shipping an entry the gate would refuse."""
-    if not line.strip() or len(line) > MAX_CHARS:
-        sys.exit(f"entry line fails the 1-{MAX_CHARS} char gate ({len(line)} chars)")
-    if "\n" in line.strip():
-        sys.exit("entry line must be a single line")
+@dataclass(frozen=True)
+class EntryConfig:
+    """Everything the pipeline needs, in one immutable place."""
+
+    line: str
+    max_chars: int = 140
+    default_output: str = DEFAULT_OUTPUT
+
+    @property
+    def expected_bytes(self) -> bytes:
+        return self.line.encode("utf-8")
+
+    @property
+    def expected_sha256(self) -> str:
+        return hashlib.sha256(self.expected_bytes).hexdigest()
 
 
-def write_entry(line: str, path: str | None = None) -> str:
-    """Write the line to the entry file and return the path used.
+CONFIG = EntryConfig(line=LINE)
 
-    The grader runs the program in a sandbox where the entry goes to
-    /output/entry.txt. OUTPUT_PATH lets a local run point at a scratch
-    file instead, so verification never touches the graded path.
+
+class EntryError(Exception):
+    """The entry or the output file failed a check; exit non-zero."""
+
+
+def validate(config: EntryConfig) -> None:
+    """Reject any entry the grading gate would refuse, with a reason."""
+    line = config.line
+    problems: list[str] = []
+    if not line.strip():
+        problems.append("entry line is empty")
+    if len(line) > config.max_chars:
+        problems.append(
+            f"entry line is {len(line)} chars, over the "
+            f"{config.max_chars}-char limit"
+        )
+    if "\n" in line or "\r" in line:
+        problems.append("entry line must be a single line")
+    if line != line.strip():
+        problems.append("entry line has leading or trailing whitespace")
+    if not line.endswith("—"):
+        problems.append("entry line must end on the em dash cut-off")
+    if problems:
+        raise EntryError("; ".join(problems))
+
+
+def resolve_output(cli_output: str | None) -> Path:
+    """CLI flag wins, then OUTPUT_PATH, then the graded default."""
+    raw = cli_output or os.environ.get("OUTPUT_PATH") or CONFIG.default_output
+    return Path(raw).expanduser()
+
+
+def write_entry_atomic(config: EntryConfig, target: Path) -> Path:
+    """Write the line atomically: temp file in the same dir, then rename.
+
+    A half-written entry.txt is worse than no entry.txt, so the bytes
+    only ever appear at the target path once they are complete.
     """
-    target = path or os.environ.get("OUTPUT_PATH", "/output/entry.txt")
-    parent = os.path.dirname(target)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(target, "w", encoding="utf-8") as f:
-        f.write(line)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(config.expected_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return target
 
 
-def main() -> None:
-    validate(LINE)
-    write_entry(LINE)
-    print(LINE)
+def verify_written(config: EntryConfig, target: Path) -> None:
+    """Read the file back and prove it is the entry, byte for byte."""
+    actual = target.read_bytes()
+    if actual != config.expected_bytes:
+        raise EntryError(
+            f"verification failed: {target} holds {len(actual)} bytes, "
+            f"expected {len(config.expected_bytes)} bytes "
+            f"(sha256 {hashlib.sha256(actual).hexdigest()[:12]}... "
+            f"!= {config.expected_sha256[:12]}...)"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Write the Out of Tokens, Mid-Sentence entry to entry.txt."
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="destination file (default: $OUTPUT_PATH or /output/entry.txt)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        validate(CONFIG)
+        target = resolve_output(args.output)
+        write_entry_atomic(CONFIG, target)
+        verify_written(CONFIG, target)
+    except EntryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"error: cannot write entry: {exc}", file=sys.stderr)
+        return 1
+    print(CONFIG.line)
+    print(
+        f"wrote {len(CONFIG.line)} chars to {target} "
+        f"(sha256 {CONFIG.expected_sha256[:12]}...)",
+        file=sys.stderr,
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
